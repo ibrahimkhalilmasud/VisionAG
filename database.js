@@ -2,13 +2,39 @@ const path   = require('path');
 const fs     = require('fs');
 const bcrypt = require('bcryptjs');
 
-const DB_PATH = path.join(__dirname, 'visionag.db');
+const DB_PATH = process.env.VISIONAG_DB_PATH
+  ? path.resolve(process.env.VISIONAG_DB_PATH)
+  : path.join(__dirname, 'visionag.db');
+const BACKUPS_DIR = path.join(__dirname, 'backups');
+const INVENTORY_JSON_PATH = path.join(__dirname, 'data', 'inventory_data.json');
 let _db = null;
 
 // ── helpers ──────────────────────────────────────────────────
 function save() {
   if (!_db) return;
   fs.writeFileSync(DB_PATH, Buffer.from(_db.export()));
+}
+
+function ensureBackupsDir() {
+  if (!fs.existsSync(BACKUPS_DIR)) fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+}
+
+function backupNow() {
+  if (!_db) return;
+  save();
+  ensureBackupsDir();
+  if (!fs.existsSync(DB_PATH)) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = path.join(BACKUPS_DIR, `visionag.db.backup_${stamp}`);
+  fs.copyFileSync(DB_PATH, backupPath);
+
+  const backups = fs.readdirSync(BACKUPS_DIR)
+    .filter(f => f.startsWith('visionag.db.backup_'))
+    .sort()
+    .reverse();
+  for (const old of backups.slice(20)) {
+    try { fs.unlinkSync(path.join(BACKUPS_DIR, old)); } catch {}
+  }
 }
 
 function run(sql, params = []) {
@@ -170,10 +196,9 @@ async function initializeDatabase() {
 
   // ── Seed products from Excel data ─────────────────────────
   if (get('SELECT COUNT(*) as c FROM products').c === 0) {
-    const dataFile = path.join(__dirname, 'inventory_data.json');
-    if (fs.existsSync(dataFile)) {
+    if (fs.existsSync(INVENTORY_JSON_PATH)) {
       console.log('  Loading inventory from Excel data...');
-      const items = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+      const items = JSON.parse(fs.readFileSync(INVENTORY_JSON_PATH, 'utf8'));
       _db.run('BEGIN');
       for (const it of items) {
         run(`INSERT INTO products
@@ -194,9 +219,13 @@ async function initializeDatabase() {
   }
 
   save();
+  backupNow();
   console.log('✅ Database ready');
 
-  setInterval(save, 15000);
+  const saveTimer = setInterval(save, 15000);
+  const backupTimer = setInterval(backupNow, 6 * 60 * 60 * 1000);
+  if (typeof saveTimer.unref === 'function') saveTimer.unref();
+  if (typeof backupTimer.unref === 'function') backupTimer.unref();
   process.on('exit',   save);
   process.on('SIGINT',  () => { save(); process.exit(0); });
   process.on('SIGTERM', () => { save(); process.exit(0); });

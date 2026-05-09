@@ -153,6 +153,22 @@ Automatic backups are saved in the `backups/` folder.
 
 ---
 
+## Configuration (Local / Dev / Prod)
+
+Create a `.env` file in `VisionAG/` (see `.env.example`) and set:
+
+- `JWT_SECRET` — required in production, recommended in all environments
+- `PORT` — optional, default `3000`
+- `CORS_ORIGINS` — comma-separated allowed browser origins
+- `VISIONAG_DB_PATH` — optional absolute DB path override
+
+**Production minimum:**
+- Set a strong `JWT_SECRET`
+- Set explicit `CORS_ORIGINS` for your trusted frontend origins
+- Keep `visionag.db` backed up regularly
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -188,11 +204,12 @@ Automatic backups are saved in the `backups/` folder.
 | Layer    | Technology           |
 |----------|----------------------|
 | Backend  | Node.js + Express    |
-| Database | SQLite (better-sqlite3) |
+| Database | SQLite (sql.js) |
 | Frontend | HTML / CSS / JS (vanilla) |
 | Charts   | Chart.js             |
 | Auth     | JWT + bcrypt         |
 | Photos   | Multer               |
+| Imports  | ExcelJS              |
 
 ---
 
