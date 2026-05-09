@@ -49,7 +49,6 @@ async function main() {
   db.save();
 
   // Summary
-  const { all } = db;
   const rows = db.all(
     "SELECT category, status, COUNT(*) as c FROM products WHERE active=1 GROUP BY category, status ORDER BY category, status"
   );

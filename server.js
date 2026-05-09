@@ -3,18 +3,56 @@ const express = require('express');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const multer  = require('multer');
+const rateLimit = require('express-rate-limit');
 const path    = require('path');
 const fs      = require('fs');
-const XLSX    = require('xlsx');
+const ExcelJS = require('exceljs');
 const { initializeDatabase } = require('./database');
 
 const app    = express();
-const PORT   = 3000;
-const SECRET = 'visionag_2024';
+const PORT   = Number.parseInt(process.env.PORT, 10) || 3000;
+const SECRET = process.env.JWT_SECRET || 'dev-only-change-this-secret';
+const INVENTORY_JSON_PATH = path.join(__dirname, 'data', 'inventory_data.json');
+const ALLOWED_ROLES = new Set(['admin', 'staff']);
+const ALLOWED_PRODUCT_STATUSES = new Set(['available', 'pending', 'sold']);
+const ALLOWED_INVOICE_STATUSES = new Set(['pending', 'paid', 'cancelled', 'draft']);
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || `http://localhost:${PORT},http://127.0.0.1:${PORT}`)
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
 
-app.use(require('cors')());
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET is not set. Using development fallback secret.');
+}
+
+const cors = require('cors');
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Origin not allowed by CORS'));
+  }
+}));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+const log = (level, message, meta = {}) => {
+  const entry = { ts: new Date().toISOString(), level, message, ...meta };
+  console.log(JSON.stringify(entry));
+};
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    log('info', 'http_request', {
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      duration_ms: Date.now() - start,
+      user_id: req.user?.id || null,
+    });
+  });
+  next();
+});
 
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
@@ -31,6 +69,96 @@ const photoUpload = multer({
 const importUpload = multer({ dest: uploadsDir, limits: { fileSize: 20 * 1024 * 1024 } });
 
 let db;
+const pathWithin = (baseDir, targetPath) => {
+  const normalizedBase = path.resolve(baseDir);
+  const normalizedTarget = path.resolve(targetPath);
+  return normalizedTarget.startsWith(normalizedBase + path.sep);
+};
+const safeUnlinkUpload = (targetPath) => {
+  if (!targetPath) return;
+  if (!pathWithin(uploadsDir, targetPath)) return;
+  if (!fs.existsSync(targetPath)) return;
+  fs.unlinkSync(targetPath);
+};
+
+const importRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const reloadRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const asString = v => (v === undefined || v === null ? '' : String(v).trim());
+const asNumber = v => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+const parsePositiveInt = (value, fallback, min, max) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+};
+
+const validateRole = role => !role || ALLOWED_ROLES.has(role);
+const validateProductStatus = status => !status || ALLOWED_PRODUCT_STATUSES.has(status);
+const validateInvoiceStatus = status => !status || ALLOWED_INVOICE_STATUSES.has(status);
+
+const normalizeCellValue = (cellVal) => {
+  if (cellVal === undefined || cellVal === null) return '';
+  if (typeof cellVal === 'object') {
+    if (cellVal.text !== undefined) return asString(cellVal.text);
+    if (cellVal.result !== undefined) return asString(cellVal.result);
+    if (cellVal.hyperlink !== undefined) return asString(cellVal.hyperlink);
+    if (cellVal.richText && Array.isArray(cellVal.richText)) {
+      return asString(cellVal.richText.map(rt => rt.text || '').join(''));
+    }
+    if (cellVal.formula !== undefined) return asString(cellVal.formula);
+    if (cellVal.error !== undefined) return asString(cellVal.error);
+  }
+  return asString(cellVal);
+};
+
+const parseSpreadsheetRows = async (filePath, originalName = '') => {
+  const workbook = new ExcelJS.Workbook();
+  const ext = path.extname(originalName).toLowerCase();
+  if (ext === '.csv') {
+    await workbook.csv.readFile(filePath);
+  } else {
+    await workbook.xlsx.readFile(filePath);
+  }
+  const ws = workbook.worksheets[0];
+  if (!ws) return { columns: [], rows: [] };
+
+  const headerRow = ws.getRow(1);
+  const columns = [];
+  for (let i = 1; i <= headerRow.cellCount; i++) {
+    const c = normalizeCellValue(headerRow.getCell(i).value);
+    columns.push(c || `column_${i}`);
+  }
+
+  const rows = [];
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const obj = {};
+    let hasValue = false;
+    columns.forEach((column, idx) => {
+      const value = normalizeCellValue(row.getCell(idx + 1).value);
+      obj[column] = value;
+      if (value !== '') hasValue = true;
+    });
+    if (hasValue) rows.push(obj);
+  });
+
+  return { columns, rows };
+};
+
 const auth = (req, res, next) => {
   try {
     req.user = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), SECRET);
@@ -59,28 +187,33 @@ app.get('/api/users', auth, adminOnly, (_, res) =>
 
 app.post('/api/users', auth, adminOnly, (req, res) => {
   const { username, password, full_name, role } = req.body;
+  if (!asString(username)) return res.status(400).json({ error: 'Username required' });
   if (!password) return res.status(400).json({ error: 'Password required' });
+  if (!validateRole(role || 'staff')) return res.status(400).json({ error: 'Invalid role' });
   try {
     const r = db.prepare('INSERT INTO users (username,password_hash,full_name,role) VALUES (?,?,?,?)')
-                .run(username, bcrypt.hashSync(password, 10), full_name, role||'staff');
+                .run(asString(username), bcrypt.hashSync(password, 10), asString(full_name), role||'staff');
     db.save(); res.json({ id: r.lastInsertRowid });
   } catch { res.status(400).json({ error: 'Username already exists' }); }
 });
 
 app.put('/api/users/:id', auth, adminOnly, (req, res) => {
   const { full_name, role, active, password } = req.body;
+  if (!validateRole(role)) return res.status(400).json({ error: 'Invalid role' });
   if (password)
     db.prepare('UPDATE users SET full_name=?,role=?,active=?,password_hash=? WHERE id=?')
-      .run(full_name, role, active??1, bcrypt.hashSync(password,10), req.params.id);
+      .run(asString(full_name), role, active??1, bcrypt.hashSync(password,10), req.params.id);
   else
     db.prepare('UPDATE users SET full_name=?,role=?,active=? WHERE id=?')
-      .run(full_name, role, active??1, req.params.id);
+      .run(asString(full_name), role, active??1, req.params.id);
   db.save(); res.json({ success: true });
 });
 
 // ═══════════════ PRODUCTS ════════════════════════════════════
 app.get('/api/products', auth, (req, res) => {
   const { category, brand, quality, status, color, search, page=1, limit=50 } = req.query;
+  const pageNum = parsePositiveInt(page, 1, 1, 100000);
+  const limitNum = parsePositiveInt(limit, 50, 1, 200);
   let sql = 'SELECT * FROM products WHERE active=1';
   const p = [];
   if (category) { sql += ' AND category=?'; p.push(category); }
@@ -95,9 +228,9 @@ app.get('/api/products', auth, (req, res) => {
   }
   const total = db.prepare(sql.replace('SELECT *','SELECT COUNT(*) as c')).get(...p)?.c || 0;
   sql += ' ORDER BY category,brand,id';
-  const off = (parseInt(page)-1) * parseInt(limit);
-  sql += ` LIMIT ${parseInt(limit)} OFFSET ${off}`;
-  res.json({ items: db.prepare(sql).all(...p), total, page: parseInt(page), limit: parseInt(limit) });
+  const off = (pageNum - 1) * limitNum;
+  sql += ` LIMIT ${limitNum} OFFSET ${off}`;
+  res.json({ items: db.prepare(sql).all(...p), total, page: pageNum, limit: limitNum });
 });
 
 app.get('/api/products/:id', auth, (req, res) => {
@@ -109,14 +242,16 @@ app.post('/api/products', auth, (req, res) => {
   const { category, brand, design, article, quality, color, qty,
           cost_eur, cost_rm, cost_piece_rm, vip_mt_rm, vip_piece_rm,
           sell_mt_rm, sell_piece_rm, status, sold_to, sold_date, notes } = req.body;
+  if (!asString(category)) return res.status(400).json({ error: 'Category required' });
+  if (!validateProductStatus(status || 'available')) return res.status(400).json({ error: 'Invalid status' });
   const r = db.prepare(`INSERT INTO products
     (category,brand,design,article,quality,color,qty,cost_eur,cost_rm,cost_piece_rm,
      vip_mt_rm,vip_piece_rm,sell_mt_rm,sell_piece_rm,status,sold_to,sold_date,notes)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(category,brand,design,article,quality,color||null,+qty||0,
-         +cost_eur||0,+cost_rm||0,+cost_piece_rm||0,
-         +vip_mt_rm||0,+vip_piece_rm||0,+sell_mt_rm||0,+sell_piece_rm||0,
-         status||'available',sold_to||null,sold_date||null,notes||null);
+    .run(asString(category),asString(brand),asString(design),asString(article),asString(quality),asString(color)||null,asNumber(qty),
+         asNumber(cost_eur),asNumber(cost_rm),asNumber(cost_piece_rm),
+         asNumber(vip_mt_rm),asNumber(vip_piece_rm),asNumber(sell_mt_rm),asNumber(sell_piece_rm),
+         status||'available',asString(sold_to)||null,asString(sold_date)||null,asString(notes)||null);
   db.save(); res.json({ id: r.lastInsertRowid });
 });
 
@@ -125,18 +260,20 @@ app.put('/api/products/:id', auth, (req, res) => {
           cost_eur, cost_rm, cost_piece_rm, vip_mt_rm, vip_piece_rm,
           sell_mt_rm, sell_piece_rm, status, sold_to, sold_date,
           actual_sell_rm, commission_pct, net_profit, notes } = req.body;
+  if (!asString(category)) return res.status(400).json({ error: 'Category required' });
+  if (!validateProductStatus(status || 'available')) return res.status(400).json({ error: 'Invalid status' });
   db.prepare(`UPDATE products SET
     category=?,brand=?,design=?,article=?,quality=?,color=?,qty=?,
     cost_eur=?,cost_rm=?,cost_piece_rm=?,vip_mt_rm=?,vip_piece_rm=?,
     sell_mt_rm=?,sell_piece_rm=?,status=?,sold_to=?,sold_date=?,
     actual_sell_rm=?,commission_pct=?,net_profit=?,notes=?,
     updated_at=datetime('now') WHERE id=?`)
-    .run(category,brand,design,article,quality,color||null,+qty||0,
-         +cost_eur||0,+cost_rm||0,+cost_piece_rm||0,
-         +vip_mt_rm||0,+vip_piece_rm||0,+sell_mt_rm||0,+sell_piece_rm||0,
-         status||'available',sold_to||null,sold_date||null,
-         +actual_sell_rm||0,+commission_pct||0,+net_profit||0,
-         notes||null,req.params.id);
+    .run(asString(category),asString(brand),asString(design),asString(article),asString(quality),asString(color)||null,asNumber(qty),
+         asNumber(cost_eur),asNumber(cost_rm),asNumber(cost_piece_rm),
+         asNumber(vip_mt_rm),asNumber(vip_piece_rm),asNumber(sell_mt_rm),asNumber(sell_piece_rm),
+         status||'available',asString(sold_to)||null,asString(sold_date)||null,
+         asNumber(actual_sell_rm),asNumber(commission_pct),asNumber(net_profit),
+         asString(notes)||null,req.params.id);
   db.save(); res.json({ success: true });
 });
 
@@ -154,9 +291,10 @@ app.post('/api/products/:id/photo', auth, photoUpload.single('photo'), (req, res
 
 app.patch('/api/products/:id/status', auth, (req, res) => {
   const { status, sold_to, sold_date, actual_sell_rm, commission_pct, net_profit } = req.body;
+  if (!validateProductStatus(status)) return res.status(400).json({ error: 'Invalid status' });
   db.prepare(`UPDATE products SET status=?,sold_to=?,sold_date=?,actual_sell_rm=?,
     commission_pct=?,net_profit=?,updated_at=datetime('now') WHERE id=?`)
-    .run(status, sold_to||null, sold_date||null, +actual_sell_rm||0, +commission_pct||0, +net_profit||0, req.params.id);
+    .run(status, asString(sold_to)||null, asString(sold_date)||null, asNumber(actual_sell_rm), asNumber(commission_pct), asNumber(net_profit), req.params.id);
   db.save(); res.json({ success: true });
 });
 
@@ -316,88 +454,93 @@ app.get('/api/sales', auth, (req, res) => {
 });
 
 // ═══════════════ EXCEL IMPORT ════════════════════════════════
-app.post('/api/import/preview', auth, importUpload.single('file'), (req, res) => {
+app.post('/api/import/preview', importRateLimit, auth, importUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  try {
-    const wb = XLSX.readFile(req.file.path);
-    const sheetName = wb.SheetNames[0];
-    const ws = wb.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-    fs.unlinkSync(req.file.path);
-    if (!rows.length) return res.status(400).json({ error: 'File appears empty' });
-    const columns = Object.keys(rows[0]);
-    res.json({ columns, preview: rows.slice(0, 8), total: rows.length, sheets: wb.SheetNames });
-  } catch(e) {
-    try { fs.unlinkSync(req.file.path); } catch {}
-    res.status(500).json({ error: 'Could not parse file: ' + e.message });
-  }
+  parseSpreadsheetRows(req.file.path, req.file.originalname)
+    .then(({ columns, rows }) => {
+      safeUnlinkUpload(req.file.path);
+      if (!rows.length) return res.status(400).json({ error: 'File appears empty' });
+      res.json({ columns, preview: rows.slice(0, 8), total: rows.length, sheets: ['Sheet1'] });
+    })
+    .catch((e) => {
+      try { safeUnlinkUpload(req.file.path); } catch {}
+      res.status(500).json({ error: 'Could not parse file: ' + e.message });
+    });
 });
 
-app.post('/api/import/commit', auth, importUpload.single('file'), (req, res) => {
+app.post('/api/import/commit', importRateLimit, auth, importUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
-  try {
-    const mapping = JSON.parse(req.body.mapping || '{}');
-    const defaultCategory = req.body.category || 'SILK';
-    const wb = XLSX.readFile(req.file.path);
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-
-    const getVal = (row, field) => {
-      const col = mapping[field];
-      if (!col) return '';
-      const v = row[col];
-      return v !== undefined && v !== null ? String(v).trim() : '';
-    };
-    const getNum = (row, field) => parseFloat(getVal(row, field)) || 0;
-
-    let imported = 0, skipped = 0;
-    db.run('BEGIN');
-    for (const row of rows) {
-      const design  = getVal(row,'design');
-      const article = getVal(row,'article');
-      const brand   = getVal(row,'brand');
-      if (!design && !article && !brand) { skipped++; continue; }
+  parseSpreadsheetRows(req.file.path, req.file.originalname)
+    .then(({ rows }) => {
+      let mapping;
       try {
-        const soldTo = getVal(row,'sold_to');
-        const status = soldTo ? 'sold' : (getVal(row,'status') || 'available');
-        db.run(`INSERT INTO products
-          (category,brand,design,article,quality,color,qty,
-           cost_eur,cost_rm,cost_piece_rm,vip_mt_rm,vip_piece_rm,
-           sell_mt_rm,sell_piece_rm,status,sold_to,sold_date,notes)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-          [
-            getVal(row,'category') || defaultCategory,
-            brand, design, article,
-            getVal(row,'quality'), getVal(row,'color') || null,
-            getNum(row,'qty'),
-            getNum(row,'cost_eur'), getNum(row,'cost_rm'), getNum(row,'cost_piece_rm'),
-            getNum(row,'vip_mt_rm'), getNum(row,'vip_piece_rm'),
-            getNum(row,'sell_mt_rm'), getNum(row,'sell_piece_rm'),
-            status, soldTo || null,
-            getVal(row,'sold_date') || null,
-            getVal(row,'notes') || null
-          ]
-        );
-        imported++;
-      } catch { skipped++; }
-    }
-    db.run('COMMIT');
-    db.save();
-    fs.unlinkSync(req.file.path);
-    res.json({ success: true, imported, skipped, total: rows.length });
-  } catch(e) {
-    db.run('ROLLBACK');
-    try { fs.unlinkSync(req.file.path); } catch {}
-    res.status(500).json({ error: e.message });
-  }
+        mapping = JSON.parse(req.body.mapping || '{}');
+      } catch {
+        throw new Error('Invalid mapping JSON');
+      }
+      if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
+        throw new Error('Invalid mapping payload');
+      }
+      const defaultCategory = asString(req.body.category || 'SILK').toUpperCase();
+      if (!defaultCategory) throw new Error('Category is required');
+
+      const getVal = (row, field) => {
+        const col = mapping[field];
+        if (!col) return '';
+        const v = row[col];
+        return v !== undefined && v !== null ? String(v).trim() : '';
+      };
+      const getNum = (row, field) => parseFloat(getVal(row, field)) || 0;
+
+      let imported = 0, skipped = 0;
+      db.run('BEGIN');
+      for (const row of rows) {
+        const design  = getVal(row,'design');
+        const article = getVal(row,'article');
+        const brand   = getVal(row,'brand');
+        if (!design && !article && !brand) { skipped++; continue; }
+        try {
+          const soldTo = getVal(row,'sold_to');
+          const status = soldTo ? 'sold' : (getVal(row,'status') || 'available');
+          if (!validateProductStatus(status)) { skipped++; continue; }
+          db.run(`INSERT INTO products
+            (category,brand,design,article,quality,color,qty,
+             cost_eur,cost_rm,cost_piece_rm,vip_mt_rm,vip_piece_rm,
+             sell_mt_rm,sell_piece_rm,status,sold_to,sold_date,notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              getVal(row,'category') || defaultCategory,
+              brand, design, article,
+              getVal(row,'quality'), getVal(row,'color') || null,
+              getNum(row,'qty'),
+              getNum(row,'cost_eur'), getNum(row,'cost_rm'), getNum(row,'cost_piece_rm'),
+              getNum(row,'vip_mt_rm'), getNum(row,'vip_piece_rm'),
+              getNum(row,'sell_mt_rm'), getNum(row,'sell_piece_rm'),
+              status, soldTo || null,
+              getVal(row,'sold_date') || null,
+              getVal(row,'notes') || null
+            ]
+          );
+          imported++;
+        } catch { skipped++; }
+      }
+      db.run('COMMIT');
+      db.save();
+      safeUnlinkUpload(req.file.path);
+      res.json({ success: true, imported, skipped, total: rows.length });
+    })
+    .catch((e) => {
+      try { db.run('ROLLBACK'); } catch {}
+      try { safeUnlinkUpload(req.file.path); } catch {}
+      res.status(500).json({ error: e.message });
+    });
 });
 
 // ═══════════════ RELOAD INVENTORY FROM JSON ══════════════════
-app.post('/api/admin/reload-inventory', auth, adminOnly, (req, res) => {
+app.post('/api/admin/reload-inventory', reloadRateLimit, auth, adminOnly, (req, res) => {
   try {
-    const dataFile = path.join(__dirname, 'inventory_data.json');
-    if (!fs.existsSync(dataFile)) return res.status(404).json({ error: 'inventory_data.json not found' });
-    const items = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+    if (!fs.existsSync(INVENTORY_JSON_PATH)) return res.status(404).json({ error: 'inventory_data.json not found' });
+    const items = JSON.parse(fs.readFileSync(INVENTORY_JSON_PATH, 'utf8'));
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'File empty or invalid' });
 
     db.run('BEGIN');
@@ -576,7 +719,13 @@ app.get('/api/invoices/:id', auth, (req, res) => {
 
 app.post('/api/invoices', auth, (req, res) => {
   const { invoice_number, client_id, invoice_date, currency, discount_pct, tax_pct, notes, status, items } = req.body;
+  if (!asString(invoice_number)) return res.status(400).json({ error: 'Invoice number required' });
+  if (!asString(invoice_date)) return res.status(400).json({ error: 'Invoice date required' });
+  if (!validateInvoiceStatus(status || 'pending')) return res.status(400).json({ error: 'Invalid invoice status' });
   if (!items?.length) return res.status(400).json({ error: 'Add at least one item' });
+  if (!items.every(i => asNumber(i.quantity) > 0 && asNumber(i.unit_price) >= 0)) {
+    return res.status(400).json({ error: 'Invoice items must have valid quantity and unit price' });
+  }
   const subtotal = items.reduce((s,i) => s + i.quantity*i.unit_price, 0);
   const dp=+discount_pct||0, tp=+tax_pct||0;
   const disc=subtotal*(dp/100), tax=(subtotal-disc)*(tp/100), total=subtotal-disc+tax;
@@ -596,6 +745,7 @@ app.post('/api/invoices', auth, (req, res) => {
 });
 
 app.put('/api/invoices/:id/status', auth, (req, res) => {
+  if (!validateInvoiceStatus(req.body.status)) return res.status(400).json({ error: 'Invalid invoice status' });
   db.prepare('UPDATE invoices SET status=? WHERE id=?').run(req.body.status, req.params.id);
   db.save(); res.json({ success: true });
 });
@@ -605,21 +755,50 @@ app.delete('/api/invoices/:id', auth, adminOnly, (req, res) => {
   db.save(); res.json({ success: true });
 });
 
+app.get('/api/health', (_, res) => {
+  const ping = db.prepare('SELECT 1 as ok').get();
+  res.json({
+    status: ping?.ok === 1 ? 'ok' : 'degraded',
+    uptime_seconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ── SPA fallback ──────────────────────────────────────────────
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Not found' });
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+app.use((err, req, res, next) => {
+  log('error', 'unhandled_error', {
+    method: req.method,
+    path: req.originalUrl,
+    error: err?.message || 'Unknown error',
+  });
+  if (res.headersSent) return next(err);
+  const status = err.statusCode || err.status || 500;
+  res.status(status).json({ error: status >= 500 ? 'Internal server error' : err.message });
+});
+
 // ── Start ─────────────────────────────────────────────────────
-(async () => {
+async function startServer(port = PORT) {
   console.log('\n  Starting VisionAG Inventory v2...');
   db = await initializeDatabase();
-  app.listen(PORT, () => {
+  return app.listen(port, () => {
     console.log('\n╔══════════════════════════════════════╗');
     console.log('║   VisionAG Inventory v2 — RUNNING    ║');
-    console.log(`║   http://localhost:${PORT}                ║`);
+    console.log(`║   http://localhost:${port}                ║`);
     console.log('║   admin/admin123  |  staff/staff123  ║');
     console.log('╚══════════════════════════════════════╝\n');
   });
-})();
+}
+
+if (require.main === module) {
+  startServer().catch((e) => {
+    log('error', 'startup_failed', { error: e.message });
+    process.exit(1);
+  });
+}
+
+module.exports = { app, startServer };
