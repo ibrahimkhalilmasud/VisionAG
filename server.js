@@ -460,7 +460,7 @@ app.get('/api/sales', auth, (req, res) => {
 });
 
 // ═══════════════ EXCEL IMPORT ════════════════════════════════
-app.post('/api/import/preview', auth, importRateLimit, importUpload.single('file'), (req, res) => {
+app.post('/api/import/preview', importRateLimit, auth, importUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   parseSpreadsheetRows(req.file.path, req.file.originalname)
     .then(({ columns, rows }) => {
@@ -474,7 +474,7 @@ app.post('/api/import/preview', auth, importRateLimit, importUpload.single('file
     });
 });
 
-app.post('/api/import/commit', auth, importRateLimit, importUpload.single('file'), (req, res) => {
+app.post('/api/import/commit', importRateLimit, auth, importUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
   parseSpreadsheetRows(req.file.path, req.file.originalname)
     .then(({ rows }) => {
@@ -543,7 +543,7 @@ app.post('/api/import/commit', auth, importRateLimit, importUpload.single('file'
 });
 
 // ═══════════════ RELOAD INVENTORY FROM JSON ══════════════════
-app.post('/api/admin/reload-inventory', auth, adminOnly, reloadRateLimit, (req, res) => {
+app.post('/api/admin/reload-inventory', reloadRateLimit, auth, adminOnly, (req, res) => {
   try {
     if (!fs.existsSync(INVENTORY_JSON_PATH)) return res.status(404).json({ error: 'inventory_data.json not found' });
     const items = JSON.parse(fs.readFileSync(INVENTORY_JSON_PATH, 'utf8'));
