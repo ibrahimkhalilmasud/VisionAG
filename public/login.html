@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>VisionAG — Login</title>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" rel="stylesheet"/>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet"/>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Segoe UI', sans-serif;
+  }
+  .login-card {
+    background: rgba(255,255,255,0.05);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 20px;
+    padding: 48px 40px;
+    width: 100%;
+    max-width: 420px;
+    box-shadow: 0 25px 50px rgba(0,0,0,0.5);
+  }
+  .brand-logo {
+    width: 70px; height: 70px;
+    background: linear-gradient(135deg, #e94560, #0f3460);
+    border-radius: 18px;
+    display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 20px;
+    font-size: 28px; color: white;
+    box-shadow: 0 8px 20px rgba(233,69,96,0.4);
+  }
+  h1 { color: #fff; font-size: 28px; font-weight: 700; text-align: center; margin-bottom: 4px; }
+  .tagline { color: rgba(255,255,255,0.5); text-align: center; font-size: 13px; margin-bottom: 36px; }
+  .form-label { color: rgba(255,255,255,0.8); font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
+  .form-control {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 10px;
+    color: #fff;
+    padding: 12px 16px;
+    font-size: 15px;
+    transition: all 0.3s;
+  }
+  .form-control:focus {
+    background: rgba(255,255,255,0.12);
+    border-color: #e94560;
+    box-shadow: 0 0 0 3px rgba(233,69,96,0.2);
+    color: #fff;
+  }
+  .form-control::placeholder { color: rgba(255,255,255,0.3); }
+  .input-group-text {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-right: none;
+    color: rgba(255,255,255,0.5);
+    border-radius: 10px 0 0 10px;
+  }
+  .input-group .form-control { border-left: none; border-radius: 0 10px 10px 0; }
+  .btn-login {
+    background: linear-gradient(135deg, #e94560, #c23152);
+    border: none; color: white; border-radius: 10px;
+    padding: 13px; font-size: 15px; font-weight: 600;
+    width: 100%; margin-top: 8px;
+    transition: all 0.3s;
+    letter-spacing: 0.5px;
+  }
+  .btn-login:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(233,69,96,0.4); color: white; }
+  .btn-login:active { transform: translateY(0); }
+  .alert-error {
+    background: rgba(233,69,96,0.15);
+    border: 1px solid rgba(233,69,96,0.3);
+    color: #ff6b8a; border-radius: 10px;
+    padding: 12px 16px; font-size: 14px;
+    display: none;
+  }
+  .version { color: rgba(255,255,255,0.2); text-align: center; font-size: 11px; margin-top: 28px; }
+  .spinner-border { width: 18px; height: 18px; }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="brand-logo"><i class="fas fa-layer-group"></i></div>
+  <h1>VisionAG</h1>
+  <p class="tagline">Fabric Inventory Management System</p>
+
+  <div class="alert-error" id="errorMsg">
+    <i class="fas fa-exclamation-circle me-2"></i><span id="errorText">Invalid credentials</span>
+  </div>
+
+  <form id="loginForm">
+    <div class="mb-3">
+      <label class="form-label">USERNAME</label>
+      <div class="input-group">
+        <span class="input-group-text"><i class="fas fa-user"></i></span>
+        <input type="text" class="form-control" id="username" placeholder="Enter username" autocomplete="username" required/>
+      </div>
+    </div>
+    <div class="mb-4">
+      <label class="form-label">PASSWORD</label>
+      <div class="input-group">
+        <span class="input-group-text"><i class="fas fa-lock"></i></span>
+        <input type="password" class="form-control" id="password" placeholder="Enter password" autocomplete="current-password" required/>
+      </div>
+    </div>
+    <button type="submit" class="btn btn-login" id="loginBtn">
+      <span id="btnText"><i class="fas fa-sign-in-alt me-2"></i>Login</span>
+      <span id="btnSpinner" style="display:none"><span class="spinner-border spinner-border-sm me-2"></span>Signing in...</span>
+    </button>
+  </form>
+
+  <div class="version">VisionAG v1.0 &mdash; Fabric Inventory &copy; 2024</div>
+</div>
+
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('loginBtn');
+  const errDiv = document.getElementById('errorMsg');
+  document.getElementById('btnText').style.display = 'none';
+  document.getElementById('btnSpinner').style.display = 'inline';
+  btn.disabled = true;
+  errDiv.style.display = 'none';
+
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Login failed');
+    localStorage.setItem('visionag_token', data.token);
+    localStorage.setItem('visionag_user', JSON.stringify(data.user));
+    window.location.href = '/';
+  } catch (err) {
+    document.getElementById('errorText').textContent = err.message;
+    errDiv.style.display = 'block';
+    document.getElementById('btnText').style.display = 'inline';
+    document.getElementById('btnSpinner').style.display = 'none';
+    btn.disabled = false;
+  }
+});
+
+// Already logged in?
+if (localStorage.getItem('visionag_token')) window.location.href = '/';
+</script>
+</body>
+</html>
