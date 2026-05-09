@@ -68,6 +68,39 @@ const photoUpload = multer({
 const importUpload = multer({ dest: uploadsDir, limits: { fileSize: 20 * 1024 * 1024 } });
 
 let db;
+const pathWithin = (baseDir, targetPath) => {
+  const normalizedBase = path.resolve(baseDir);
+  const normalizedTarget = path.resolve(targetPath);
+  return normalizedTarget.startsWith(normalizedBase + path.sep);
+};
+const safeUnlinkUpload = (targetPath) => {
+  if (!targetPath) return;
+  if (!pathWithin(uploadsDir, targetPath)) return;
+  if (!fs.existsSync(targetPath)) return;
+  fs.unlinkSync(targetPath);
+};
+
+const createRateLimiter = ({ windowMs, max }) => {
+  const buckets = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = `${req.ip || 'unknown'}:${req.path}`;
+    const bucket = buckets.get(key);
+    if (!bucket || now >= bucket.resetAt) {
+      buckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    if (bucket.count >= max) {
+      const waitSeconds = Math.ceil((bucket.resetAt - now) / 1000);
+      return res.status(429).json({ error: `Too many requests. Try again in ${waitSeconds}s.` });
+    }
+    bucket.count += 1;
+    return next();
+  };
+};
+const importRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 10 });
+const reloadRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 3 });
+
 const asString = v => (v === undefined || v === null ? '' : String(v).trim());
 const asNumber = v => {
   const n = Number(v);
@@ -427,21 +460,21 @@ app.get('/api/sales', auth, (req, res) => {
 });
 
 // ═══════════════ EXCEL IMPORT ════════════════════════════════
-app.post('/api/import/preview', auth, importUpload.single('file'), (req, res) => {
+app.post('/api/import/preview', auth, importRateLimit, importUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   parseSpreadsheetRows(req.file.path, req.file.originalname)
     .then(({ columns, rows }) => {
-      fs.unlinkSync(req.file.path);
+      safeUnlinkUpload(req.file.path);
       if (!rows.length) return res.status(400).json({ error: 'File appears empty' });
       res.json({ columns, preview: rows.slice(0, 8), total: rows.length, sheets: ['Sheet1'] });
     })
     .catch((e) => {
-      try { fs.unlinkSync(req.file.path); } catch {}
+      try { safeUnlinkUpload(req.file.path); } catch {}
       res.status(500).json({ error: 'Could not parse file: ' + e.message });
     });
 });
 
-app.post('/api/import/commit', auth, importUpload.single('file'), (req, res) => {
+app.post('/api/import/commit', auth, importRateLimit, importUpload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
   parseSpreadsheetRows(req.file.path, req.file.originalname)
     .then(({ rows }) => {
@@ -499,18 +532,18 @@ app.post('/api/import/commit', auth, importUpload.single('file'), (req, res) => 
       }
       db.run('COMMIT');
       db.save();
-      fs.unlinkSync(req.file.path);
+      safeUnlinkUpload(req.file.path);
       res.json({ success: true, imported, skipped, total: rows.length });
     })
     .catch((e) => {
       try { db.run('ROLLBACK'); } catch {}
-      try { fs.unlinkSync(req.file.path); } catch {}
+      try { safeUnlinkUpload(req.file.path); } catch {}
       res.status(500).json({ error: e.message });
     });
 });
 
 // ═══════════════ RELOAD INVENTORY FROM JSON ══════════════════
-app.post('/api/admin/reload-inventory', auth, adminOnly, (req, res) => {
+app.post('/api/admin/reload-inventory', auth, adminOnly, reloadRateLimit, (req, res) => {
   try {
     if (!fs.existsSync(INVENTORY_JSON_PATH)) return res.status(404).json({ error: 'inventory_data.json not found' });
     const items = JSON.parse(fs.readFileSync(INVENTORY_JSON_PATH, 'utf8'));
