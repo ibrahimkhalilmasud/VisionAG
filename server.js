@@ -3,6 +3,7 @@ const express = require('express');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const multer  = require('multer');
+const rateLimit = require('express-rate-limit');
 const path    = require('path');
 const fs      = require('fs');
 const ExcelJS = require('exceljs');
@@ -80,26 +81,19 @@ const safeUnlinkUpload = (targetPath) => {
   fs.unlinkSync(targetPath);
 };
 
-const createRateLimiter = ({ windowMs, max }) => {
-  const buckets = new Map();
-  return (req, res, next) => {
-    const now = Date.now();
-    const key = `${req.ip || 'unknown'}:${req.path}`;
-    const bucket = buckets.get(key);
-    if (!bucket || now >= bucket.resetAt) {
-      buckets.set(key, { count: 1, resetAt: now + windowMs });
-      return next();
-    }
-    if (bucket.count >= max) {
-      const waitSeconds = Math.ceil((bucket.resetAt - now) / 1000);
-      return res.status(429).json({ error: `Too many requests. Try again in ${waitSeconds}s.` });
-    }
-    bucket.count += 1;
-    return next();
-  };
-};
-const importRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 10 });
-const reloadRateLimit = createRateLimiter({ windowMs: 60 * 1000, max: 3 });
+const importRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const reloadRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 const asString = v => (v === undefined || v === null ? '' : String(v).trim());
 const asNumber = v => {
